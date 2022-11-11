@@ -1,0 +1,1889 @@
+---
+title: "BICS Employment Analysis"
+author: "Ethan Roubenoff"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+header-includes: \usepackage{amsmath}
+---
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo=F,
+                      results=F,
+                      warning=F)
+```
+
+Below contains various simulations for the SEI2RVD model.
+
+```{r, include=FALSE}
+library(lubridate)
+library(RColorBrewer)
+library(tictoc)
+library(lhs)
+library(foreach)
+library(doParallel)
+library(ggpattern)
+source(file.path('SEIR.R'))
+figs_path <- "./figs"
+run_sim <- TRUE # If false, loads cached data
+```
+
+
+# Standardized plotting info 
+```{r}
+prior_remap <- c("No Vax"= "#fde725",
+                 "65+ Prior" = "#35b779",
+                 "HC Prior" = "#31688e",
+                 "Split Prior" = "#440154",
+                 "Tiered 65+" = "#35b779",
+                 "Tiered HC" = "#31688e")
+
+lty_remap <- c(
+  "No Vax" = "solid",
+  "65+ Prior" = "solid",
+  "HC Prior" = "solid",
+  "Split Prior" = "solid",
+  "Tiered 65+" = "dotted",
+  "Tiered HC" = "dotted"
+)
+
+alpha_remap <- c("No Vax"= 1,
+                 "65+ Prior" = 1,
+                 "HC Prior" = 1,
+                 "Split Prior" = 1,
+                 "Tiered 65+" = .3,
+                 "Tiered HC" = .5)
+
+
+group_remap <- c("65+" = "solid", "HC Adults" = "dashed",  "LC Adults" = "dotdash", "Children" = "dotted")
+
+stat_remap <- c("Deaths" = " darkGreen", "Infections" = "darkBlue")
+
+theme_set(theme_cowplot(font_size = 12)) 
+
+
+linewidth = .8 
+linealpha =.9 
+
+
+plotwidth = 7
+plotscale = 1.5
+```
+
+
+
+# Figure 1: contact matrix
+```{r}
+cm_df <- melt(C) %>% rename(Ego= "Var1", Alter= "Var2")
+
+cm_df <- cm_df %>% mutate(
+  Ego = factor(Ego, 
+               levels = c("child", "adult_notworking_inperson", "adult_working_inperson", "senior"),
+               labels = c("Child", "Adult LC", "Adult HC", "65+")),
+  Alter = factor(Alter, 
+               levels = c("child", "adult_notworking_inperson", "adult_working_inperson", "senior"),
+               labels = c("Child", "Adult LC", "Adult HC", "65+")),
+)
+
+cm_plot <- ggplot(cm_df) + 
+  geom_tile(aes(x = Alter, y = Ego, fill = value)) + 
+  labs(fill= "Average\nContacts") +
+  theme(asp =1,
+        axis.text.y = element_text(angle = 45, hjust=1)) 
+
+cm_legend <- get_legend(cm_plot) 
+cm_plot <- cm_plot +  theme(legend.position = "none") 
+
+cm_ego_marginals <- ggplot(cm_df %>% group_by(Ego) %>% summarize(contacts = sum(value))) + 
+  geom_col(aes(x = Ego, y = contacts)) +  
+  xlab("Ego") + 
+  ylab("Total Average Contacts") + 
+  theme(asp =1)  +
+  coord_flip()  
+
+
+cm_fig <- plot_grid(
+  cm_plot,
+  cm_legend,
+  cm_ego_marginals,
+  nrow = 1,
+  rel_widths = c(1, .2, 1),
+  labels = c("A", "" , "B")
+)
+
+
+cm_fig %>% 
+  ggsave(file.path(figs_path, "cm_plot.png"), ., height = 3, width = 6, scale= plotscale)
+
+stargazer::stargazer(C)
+
+knitr::include_graphics(file.path(figs_path, "cm_plot.png"))
+```
+
+
+
+# Degree distribution
+
+
+```{r}
+num_cc <- df$num_cc_nonhh * df$weight_pooled
+num_cc[num_cc > 30] <- 30
+work_cc <- df$num_cc_work* df$weight_pooled
+# work_cc[is.na(work_cc)] <- 0
+work_cc <- work_cc[!is.na(work_cc)]
+degree_distribution <- plot_grid(
+  qplot(num_cc) + theme_cowplot() + xlab("") + 
+    geom_vline(aes(xintercept = mean(num_cc)), color = "red"),
+  qplot(work_cc)+ theme_cowplot() + xlab("") + 
+    geom_vline(aes(xintercept = mean(work_cc)), color = "red"),
+  nrow = 2,
+  labels =c("A", "B"), 
+  axis = "l"
+) 
+
+ggsave(file.path(figs_path,"degree_distribution.png"), degree_distribution, height = 5, width = plotwidth )
+
+knitr::include_graphics(file.path(figs_path, "degree_distribution.png"))
+```
+
+
+# Run random combinations or R0 and mu to determine the median outbreak
+```{r}
+nsims <- 1000
+set.seed(4949)
+if (run_sim) {
+  
+  
+  # LHS sampling
+  x <- randomLHS(nsims, 6)
+  # mu
+  mu_vec <- matrix(c(
+    qunif(x[,1], 0.00003, 0.00005), # child mu
+    qunif(x[,2], 0.0020, 0.0026),   # adult lr mu
+    qunif(x[,2], 0.0020, 0.0026),   # adult hr mu-- same as lr
+    qunif(x[,3], 0.069, 0.104)      # sr mu
+  ), nrow = 4, ncol = nsims, byrow = TRUE)
+  # R0
+  R0_vec <- qnorm(x[,4], 2.5, 0.54)        # r0
+  # Latent and infectious periods
+  infectiousPeriod_vec <- qunif(x[,5], 4, 6)
+  latentPeriod_Vec <- qunif(x[,6], 2, 4)
+
+  
+  registerDoParallel(7)
+  sims <- foreach (i=1:nsims, .inorder=TRUE) %dopar% {
+    sim(R0=R0_vec[i],
+        mu = c(mu_vec[,i]),
+        infectiousPeriod = infectiousPeriod_vec[i],
+        latentPeriod = latentPeriod_Vec[i],
+        wave = 4,
+        contact_matrix = C,
+        printout = FALSE)
+  }
+  
+  sims_trajectories <- map(sims, ~.$trajectories)
+  sims <- map(sims, ~.$out)
+  
+  save(R0_vec, mu_vec, sims, sims_trajectories, infectiousPeriod_vec, latentPeriod_Vec,
+       file = "sims_data/sims.RData")
+} 
+
+load("sims_data/sims.RData")
+
+
+sens_deaths_day0 <- map_dfr(sims_trajectories, ~.$trajectory_none %>% as.data.frame() %>% slice(n()))%>% 
+  select(contains("D_")) %>%
+  rowSums()
+
+sens_clinical_day0 <- map_dfr(sims_trajectories, ~.$trajectory_none %>% as.data.frame() %>% slice(n()))%>% 
+  select(contains("Cc_")) %>%
+  rowSums()
+
+sens_total_day0 <- map_dfr(sims_trajectories, ~.$trajectory_none %>% as.data.frame() %>% slice(n()))%>% 
+  select(contains("Cc_"), contains("Csc_")) %>%
+  rowSums()
+
+
+
+rm(sims_trajectories)
+
+
+median_parameters <- list(R0 = median(R0_vec), mu = apply(mu_vec, 1, median), 
+                          infectiousPeriod = median(infectiousPeriod_vec),
+                          latentPeriod = median(latentPeriod_Vec))
+
+```
+
+
+
+
+
+
+
+
+
+
+# Median parameters
+```{r, echo = T, results = T}
+options(scipen=10)
+print(median_parameters)
+```
+
+
+
+# Run median simulation:
+```{r}
+out <- sim(R0 = median_parameters[["R0"]],
+           mu = median_parameters[["mu"]],
+           infectiousPeriod = median_parameters[["infectiousPeriod"]],
+           latentPeriod = median_parameters[["latentPeriod"]],
+           wave = 4, contact_matrix= C)
+```
+
+
+
+
+## Box and whisker plot 
+```{r}
+sens_clinical <- map_dfr(sims, ~pull(.,total_clinical))
+sens_deaths <- map_dfr(sims, ~pull(.,total_deaths))
+
+
+
+bwfunc <- function(group, stat) {
+  # Subsets stat with bool vec qu for group 
+   stat <- stat[,c("trajectory_none", paste0("trajectory_", group))]
+   stat <- ((stat[,1] - stat[,2])/stat[,1])[,1] * 100
+   return(stat)
+}
+
+sim_df <- expand_grid(
+  stat = c("Clinical Infections", "Deaths"),
+  sim = c("65+ Prior", "HC Prior", "Split Prior", "Tiered 65+", "Tiered HC"),
+  n = 1:nsims,
+  value = NA_real_
+)
+
+sim_df[sim_df$stat == "Clinical Infections" &  sim_df$sim == "65+ Prior", "value"] <- bwfunc("senior", sens_clinical)
+sim_df[sim_df$stat == "Clinical Infections" &  sim_df$sim == "HC Prior", "value"] <- bwfunc("hr", sens_clinical)
+sim_df[sim_df$stat == "Clinical Infections" &  sim_df$sim == "Split Prior", "value"] <- bwfunc("split", sens_clinical)
+sim_df[sim_df$stat == "Clinical Infections" &  sim_df$sim == "Tiered 65+", "value"] <- bwfunc("tiered_sr", sens_clinical)
+sim_df[sim_df$stat == "Clinical Infections" &  sim_df$sim == "Tiered HC", "value"] <- bwfunc("tiered_hc", sens_clinical)
+sim_df[sim_df$stat == "Deaths" &  sim_df$sim == "65+ Prior", "value"] <- bwfunc("senior", sens_deaths)
+sim_df[sim_df$stat == "Deaths" &  sim_df$sim == "HC Prior", "value"] <- bwfunc("hr", sens_deaths)
+sim_df[sim_df$stat == "Deaths" &  sim_df$sim == "Split Prior", "value"] <- bwfunc("split", sens_deaths)
+sim_df[sim_df$stat == "Deaths" &  sim_df$sim == "Tiered 65+", "value"] <- bwfunc("tiered_sr", sens_deaths)
+sim_df[sim_df$stat == "Deaths" &  sim_df$sim == "Tiered HC", "value"] <- bwfunc("tiered_hc", sens_deaths)
+
+
+sim_df %>% 
+  group_by(stat, sim) %>% 
+  summarize(median = median(value), q2.5= quantile(value, 0.025), q97.5= quantile(value, 0.975))
+
+
+lty_remap2 <- lty_remap
+lty_remap2[lty_remap == "dotted"] <- "dashed"
+
+sim_summary <- ggplot(sim_df) +
+  geom_boxplot(aes(x = stat, y = value, color= sim,linetype = sim), fill = "white") +
+  # geom_boxplot_pattern(aes(x  = state, y = value, fill = sim, alpha = sim)) + 
+  ylab("% Reduction") + 
+  xlab("") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6])
+
+
+
+```
+
+
+#  Deaths and infections averted  
+```{r}
+
+# Deaths 
+date_ts <- seq(from = lubridate::mdy("01-01-2021"), length.out = 366,by = "1 day")[1:100]
+deaths_ts_novax <- out$trajectories$trajectory_none %>% as_tibble() %>% select(contains("D_")) %>% rowSums() %>% .[1:100]
+deaths_ts_seniorvax <- out$trajectories$trajectory_senior %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+deaths_ts_splitvax <- out$trajectories$trajectory_split %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+deaths_ts_hrvax <- out$trajectories$trajectory_hr %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+deaths_ts_tiered_sr <- out$trajectories$trajectory_tiered_sr %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+deaths_ts_tiered_hc <- out$trajectories$trajectory_tiered_hc %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+
+deaths_ts <- tibble(
+  date = date_ts,
+  `65+ Prior` = (deaths_ts_novax - deaths_ts_seniorvax),
+  `Split Prior` = (deaths_ts_novax - deaths_ts_splitvax),
+  `HC Prior` = (deaths_ts_novax - deaths_ts_hrvax),
+  `Tiered 65+` = (deaths_ts_novax - deaths_ts_tiered_sr),
+  `Tiered HC` = (deaths_ts_novax - deaths_ts_tiered_hc)
+) %>% slice(2:n()) %>%
+  pivot_longer(-date, names_to = "name", values_to = "value")
+
+
+deaths_averted <- ggplot(deaths_ts) +
+  geom_line(aes(date, value, color = name, linetype = name), alpha = linealpha) +
+  xlab("Date") + 
+  ylab("Deaths Averted") + 
+  labs(color = "") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6]) +
+  theme(legend.position = c(0.65, 0.75))  + 
+  scale_y_continuous(labels = scales::comma)
+
+
+
+
+# Infections
+date_ts <- seq(from = lubridate::mdy("01-01-2021"), length.out = 366,by = "1 day")[1:100]
+inf_ts_novax <- out$trajectories$trajectory_none %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums() %>% .[1:100]
+inf_ts_seniorvax <- out$trajectories$trajectory_senior %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+inf_ts_splitvax <- out$trajectories$trajectory_split %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+inf_ts_hrvax <- out$trajectories$trajectory_hr %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+inf_ts_tiered_sr <- out$trajectories$trajectory_tiered_sr %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+inf_ts_tiered_hc <- out$trajectories$trajectory_tiered_hc %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+
+
+inf_ts <- tibble(
+  date = date_ts,
+  `65+ Prior` = inf_ts_novax - inf_ts_seniorvax,
+  `Split Prior` = inf_ts_novax - inf_ts_splitvax,
+  `HC Prior` = inf_ts_novax - inf_ts_hrvax,
+  `Tiered 65+` = inf_ts_novax - inf_ts_tiered_sr,
+  `Tiered HC` = inf_ts_novax - inf_ts_tiered_hc
+) %>% slice(2:n()) %>%
+  pivot_longer(-date, names_to = "name", values_to = "value")
+
+infections_averted <- ggplot(inf_ts) +
+  geom_line(aes(date, value, color = name, linetype = name), alpha = linealpha) +
+  xlab("Date") + 
+  ylab("Clinical Infections Averted") + 
+  labs(color = "") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6]) +
+  theme(legend.position = c(0.65, 0.75))  + 
+  scale_y_continuous(labels = scales::comma)
+
+
+```
+
+
+# Figure 2
+```{r}
+fig2 <- plot_grid(
+  sim_summary+ theme(legend.position = "none"), 
+  plot_grid(
+    infections_averted + theme(legend.position = c(.6, .35)) + ggtitle(""),
+    deaths_averted + theme(legend.position = "none") + ggtitle(""),
+    align = "hv",
+    labels = c("B", "C"),
+    nrow = 1
+  ),
+  ncol = 1,
+  labels = c("A", "")
+  )
+
+ggsave(file.path(figs_path, "fig2.png"), fig2, width = plotwidth, height = 7, bg = "white", scale = plotscale)
+knitr::include_graphics(file.path(figs_path, "fig2.png"))
+
+
+```
+
+
+
+
+## Plot to compare incidence trajectories 
+
+
+```{r}
+n_vec <- c(child = 73429392, adult_notworking_inperson =  132319840.62, adult_working_inperson = 68164766.4, senior =  50783796.0) / 100000
+date_vec <- seq(from = lubridate::mdy("01-01-2021"),
+    length.out = 100,
+    by = "1 day")
+
+
+Cc_trajectory <- function(plot, out, group, n=100) {
+  Cc <- paste0("Cc_", group)
+  return(
+    plot + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_none[1:n,Cc]/n_vec[group], 
+                               color = "No Vax", linetype = "No Vax")) + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_senior[1:n,Cc]/n_vec[group], 
+                               color = "65+ Prior", linetype = "65+ Prior")) + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_hr[1:n,Cc]/n_vec[group], 
+                               color = "HC Prior", linetype = "HC Prior")) + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_split[1:n,Cc]/n_vec[group], 
+                               color = "Split Prior", linetype= "Split Prior"))  +
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_tiered_sr[1:n,Cc]/n_vec[group], 
+                               color = "Tiered 65+", linetype = "Tiered 65+"))  +
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_tiered_hc[1:n,Cc]/n_vec[group], 
+                               color = "Tiered HC", linetype= "Tiered HC"))  +
+       scale_color_manual("Prioritization\nStrategy", values = prior_remap) +    
+       scale_linetype_manual("Prioritization\nStrategy", values = lty_remap) +    
+       ylab("") +
+       xlab("") 
+    )
+}
+
+D_trajectory <- function(plot, out, group, n=100) {
+  D <- paste0("D_", group)
+  return(
+    plot + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_none[1:n,D]/n_vec[group], 
+                               color = "No Vax",linetype= "No Vax")) + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_senior[1:n,D]/n_vec[group], 
+                               color = "65+ Prior", linetype = "65+ Prior" )) + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_hr[1:n,D]/n_vec[group], 
+                               color = "HC Prior", linetype = "HC Prior")) + 
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_split[1:n,D]/n_vec[group], 
+                               color = "Split Prior", linetype = "Split Prior"))  +
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_tiered_sr[1:n,D]/n_vec[group], 
+                               color = "Tiered 65+", linetype =  "Tiered 65+"))  +
+       geom_line(mapping = aes(x = date_vec, 
+                               y=out$trajectories$trajectory_tiered_hc[1:n,D]/n_vec[group], 
+                               color = "Tiered HC", linetype = "Tiered HC"))  +
+       scale_color_manual("Prioritization\nStrategy", values = prior_remap) +    
+       scale_linetype_manual("Prioritization\nStrategy", values = lty_remap) +    
+       ylab("") +
+       xlab("")
+    )
+}
+
+cumulative_trajectory <- plot_grid(
+  plot_grid(
+    Cc_trajectory(ggplot(), out, group= "senior") + 
+      theme(legend.position = "none") +  
+      ylab("Clinical Infections (Per 100k)"),
+    Cc_trajectory(ggplot(), out, group= "adult_working_inperson") + 
+      theme(legend.position = "none"),
+    Cc_trajectory(ggplot(), out, group= "adult_notworking_inperson") + 
+      theme(legend.position = "none"),
+    Cc_trajectory(ggplot(), out, group= "child") + 
+      theme(legend.position = "none"),
+
+    D_trajectory(ggplot(), out, group= "senior") + 
+      theme(legend.position = "none") +  
+      ylab("Deaths (Per 100k)"),
+    D_trajectory(ggplot(), out, group= "adult_working_inperson") + 
+      theme(legend.position = "none"),
+    D_trajectory(ggplot(), out, group= "adult_notworking_inperson") + 
+      theme(legend.position = "none"),
+    D_trajectory(ggplot(), out, group= "child") + 
+      theme(legend.position = "none"),
+    align  ='v',
+    labels=c("A","B","C","D"),
+    nrow = 2),
+  get_legend(Cc_trajectory(ggplot(), out, group= "senior")),
+  nrow = 1,
+  rel_widths = c(4, 1)
+
+)
+
+ggsave(file.path(figs_path, "cumulative_trajectory.png"), cumulative_trajectory, width = plotwidth, height = 4, scale =plotscale)
+
+knitr::include_graphics(file.path(figs_path, "cumulative_trajectory.png"))
+```
+
+
+
+
+
+
+# Sensitivity analyses
+
+## Vary R0 linearly and plot 
+```{r}
+if (run_sim) {
+  
+  registerDoParallel(detectCores())
+  
+  R0_sims <- foreach (R0=seq(1, 5, .1)) %dopar% {
+   sim(R0=R0, mu = median_parameters[["mu"]],
+                     wave = 4, contact_matrix = C,
+                     printout = FALSE)$out
+  }
+  
+  R0_sims <- bind_cols(
+    bind_rows(R0_sims),
+    index = rep(1:length(R0_sims), each=6),
+    R0 = rep(seq(1, 5, .1), each = 6)
+  )
+  
+  R0_sims <- R0_sims %>%
+    pivot_wider(id_cols = c(index, R0), names_from = sim, values_from = c(total_deaths, total_clinical)) 
+  
+  save(R0_sims, file="sims_data/R0_sims.RData")
+}
+
+load("sims_data/R0_sims.RData")
+
+
+
+R0_sims_plot <- plot_grid(
+  
+  R0_sims %>% ggplot() +
+    geom_line(aes(R0, total_deaths_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(R0, total_deaths_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(R0, total_deaths_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(R0, total_deaths_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(R0, total_deaths_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+")) +
+    geom_line(aes(R0, total_deaths_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total Deaths") +
+    theme(legend.position = "none") + 
+    scale_y_continuous(labels = scales::comma),
+  
+  R0_sims %>% ggplot() +
+    geom_line(aes(R0, total_clinical_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(R0, total_clinical_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(R0, total_clinical_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(R0, total_clinical_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(R0, total_clinical_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+")) +
+    geom_line(aes(R0, total_clinical_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    scale_color_manual("Prioritization\nStrategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization\nStrategy", values = lty_remap) +
+    ylab("Total Clinical") +
+    theme(legend.position = c(0.65, 0.3)) + 
+    scale_y_continuous(labels = scales::comma),   
+  
+    # get_legend(R0_sims %>% ggplot() +
+    #   geom_line(aes(R0, total_clinical_trajectory_none, color = "No Vax")) +
+    #   scale_color_manual("Prioritization Strategy", values = prior_remap)+
+    #   scale_linetype_manual("Prioritization Strategy", values = lty_remap) ),
+  nrow =1,
+  labels =c("A","B")
+  
+)
+
+ggsave(file.path(figs_path, "R0_plot.png"), R0_sims_plot, height = 3, width = plotwidth, scale = plotscale)
+  
+knitr::include_graphics(file.path(figs_path, "R0_plot.png"))
+```
+
+
+
+
+## Vary senior mortality and plot
+```{r}
+nsims <- 20
+if (run_sim) {
+  
+  registerDoParallel(detectCores())
+  
+  # Vary senior mortality from 1% to 10%
+  mu_vec2 <- matrix(c(
+    rep(median_parameters[["mu"]][1:3], each = nsims),
+    seq(0.01, 0.1, length.out = nsims)
+  ), nrow = 4, byrow=TRUE)
+  
+  mu_sims_list <- foreach (i=1:nsims) %dopar% {
+   sim(R0=median_parameters[["R0"]], 
+       mu = c(mu_vec2[,i]),
+       wave = 4, contact_matrix = C,
+       printout = FALSE)
+  }
+  
+  weighted_mu_vec <- map_dbl(1:nsims, ~weighted.mean(mu_vec2[,.], n_vec))
+  
+  mu_sims <- bind_cols(
+    bind_rows(map(mu_sims_list, ~.$out)),
+    index = rep(1:length(weighted_mu_vec), each=6),
+    mu = rep(weighted_mu_vec, each = 6)
+  )
+  
+  mu_sims <- mu_sims %>%
+    pivot_wider(id_cols = c(index, mu), names_from = sim, values_from = c(total_deaths, total_clinical)) 
+  
+  save(mu_sims, file="sims_data/mu_sims.RData")
+}
+
+load("sims_data/mu_sims.RData")
+
+
+mu_sims_plot <- plot_grid(
+  
+  mu_sims %>% ggplot() +
+    geom_line(aes(mu, total_deaths_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(mu, total_deaths_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(mu, total_deaths_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(mu, total_deaths_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(mu, total_deaths_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+")) +
+    geom_line(aes(mu, total_deaths_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total Deaths") +
+    xlab("Standardized Mortality") +
+    theme(legend.position = "none") + 
+    scale_y_continuous(labels = scales::comma),
+  
+  mu_sims %>% ggplot() +
+    geom_line(aes(mu, total_clinical_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(mu, total_clinical_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(mu, total_clinical_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(mu, total_clinical_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(mu, total_clinical_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+")) +
+    geom_line(aes(mu, total_clinical_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    ylab("Total Clinical") +
+    xlab("Standardized Mortality") +
+    scale_color_manual("Prioritization\nStrategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization\nStrategy", values = lty_remap) +
+    theme(legend.position = c(0.65, 0.5))+ 
+    scale_y_continuous(labels = scales::comma),   
+  
+
+  nrow =1,
+  labels =c("A","B")
+  
+)
+
+ggsave(file.path(figs_path, "mu_plot.png"), mu_sims_plot, height = 3, width = plotwidth, scale = plotscale)
+  
+knitr::include_graphics(file.path(figs_path, "mu_plot.png"))
+```
+
+
+
+
+
+
+
+
+
+
+## Split proportion
+```{r}
+if (run_sim){
+  split_sims <- list()
+  split_vec <- seq(0,1,0.01)
+  
+  registerDoParallel(detectCores())
+  split_sims <- foreach (i=1:length(split_vec)) %dopar% {
+   sim(R0=median_parameters[["R0"]], mu = median_parameters[["mu"]],
+       infectiousPeriod = median_parameters[["infectiousPeriod"]],
+       latentPeriod = median_parameters[["latentPeriod"]],
+                     split_proportion = split_vec[i], 
+                     wave = 4, contact_matrix = C,
+                     printout = FALSE)$out
+   
+   
+  }
+  save(split_sims, split_vec,
+       file = "sims_data/sensitivity_analysis_split.RData")
+}
+
+load("sims_data/sensitivity_analysis_split.RData")
+
+
+split_sims <- bind_cols(
+  bind_rows(split_sims),
+  split = rep(split_vec, each = 6)
+)
+
+
+split_stats <- plot_grid(
+  ggplot(split_sims %>% filter(sim == "trajectory_split")) +
+    geom_line(aes(split, y = total_sick)) +
+    ylab("Total Infections")+
+    xlab("Split Proportion")+
+    geom_point(aes(x=0, 
+                   y = split_sims %>% 
+                     filter(split == 0, sim == "trajectory_split") %>% 
+                     pull(total_sick), color = "HC Prior"), size = 5) +
+    geom_point(aes(x=1, y = split_sims %>% 
+                     filter(split == 1, sim == "trajectory_split") %>% 
+                     pull(total_sick), color = "65+ Prior"), size = 5) +
+    scale_colour_manual("", values = prior_remap[c(2,3)]) +
+    theme(legend.position = "none")+ 
+    scale_y_continuous(labels = scales::comma)
+  ,
+  ggplot(split_sims %>% filter(sim == "trajectory_split")) +
+    geom_line(aes(split, y = total_clinical)) +
+    ylab("Clinical Infections")+
+    xlab("Split Proportion")+
+    geom_point(aes(x=0, 
+                   y = split_sims %>% 
+                     filter(split == 0, sim == "trajectory_split") %>% 
+                     pull(total_clinical), color = "HC Prior"), size = 5) +
+    geom_point(aes(x=1, y = split_sims %>% 
+                     filter(split == 1, sim == "trajectory_split") %>% 
+                     pull(total_clinical), color = "65+ Prior"), size = 5) +
+    scale_colour_manual("", values = prior_remap[c(2,3)])+
+    theme(legend.position = "none")+ 
+    scale_y_continuous(labels = scales::comma)
+  ,
+  ggplot(split_sims %>% filter(sim == "trajectory_split")) +
+    geom_line(aes(split, y = total_vaccinated)) +
+    ylab("Total Vaccinated")+
+    xlab("Split Proportion")+
+    geom_point(aes(x=0, 
+                   y = split_sims %>% 
+                     filter(split == 0, sim == "trajectory_split") %>% 
+                     pull(total_vaccinated), color = "HC Prior"), size = 5) +
+    geom_point(aes(x=1, y = split_sims %>% 
+                     filter(split == 1, sim == "trajectory_split") %>% 
+                     pull(total_vaccinated), color = "65+ Prior"), size = 5) +
+    scale_colour_manual("", values = prior_remap[c(2,3)])+
+    theme(legend.position = "none")+ 
+    scale_y_continuous(labels = scales::comma)
+  ,
+  ggplot(split_sims %>% filter(sim == "trajectory_split")) +
+    geom_line(aes(split, y = total_deaths)) +
+    ylab("Deaths")+
+    xlab("Split Proportion")+
+    geom_point(aes(x=0, 
+                   y = split_sims %>% 
+                     filter(split == 0, sim == "trajectory_split") %>% 
+                     pull(total_deaths), color = "HC Prior"), size = 5) +
+    geom_point(aes(x=1, y = split_sims %>% 
+                     filter(split == 1, sim == "trajectory_split") %>% 
+                     pull(total_deaths), color = "65+ Prior"), size = 5) +
+    scale_colour_manual("", values = prior_remap[c(2,3)])+
+    theme(legend.position = c(.5,.75))+ 
+    scale_y_continuous(labels = scales::comma)
+    ,
+  nrow = 1,
+  labels = "AUTO")
+
+
+ggsave(file.path(figs_path, "split_stats.png"), split_stats,  width = plotwidth, height = 1.5, scale =plotscale)
+
+knitr::include_graphics(file.path(figs_path, "split_stats.png"))
+
+which.min(split_sims %>% filter(sim == "trajectory_split") %>% pull(total_clinical))
+```
+
+
+
+
+
+
+## How many simulations was prioritizing [seniors, hr, split] most effective at reducing [deaths, infections]?
+```{r, results = TRUE}
+total_deaths <- map(sims, ~ pull(.,total_deaths) ) %>% bind_rows()
+total_clinical <- map(sims, ~pull(.,total_clinical)) %>% bind_rows()
+
+colnames(total_deaths)[c(total_deaths %>% apply(1, which.min))] %>% table()
+colnames(total_clinical)[c(total_clinical %>% apply(1, which.min))] %>% table()
+```
+
+
+
+## Running without contact matrix random alter reallocation
+
+
+```{r}
+invisible(sim_noreallocation <- sim(contact_matrix = C_noreallocation, 
+                                    R0 = median_parameters[["R0"]], mu = median_parameters[["mu"]],
+                                    latentPeriod = median_parameters[["latentPeriod"]],
+                                    infectiousPeriod = median_parameters[["infectiousPeriod"]]
+                                    ))
+```
+
+
+
+```{r}
+invisible(sim_noschoolclosure <- sim(contact_matrix = C_noschoolclosure, R0 = median_parameters[["R0"]], mu = median_parameters[["mu"]],
+                                    latentPeriod = median_parameters[["latentPeriod"]],
+                                    infectiousPeriod = median_parameters[["infectiousPeriod"]]
+                                    ))
+```
+
+
+
+```{r}
+
+cm_remap <- c(
+  "Baseline" = "black",
+  "Without Alter Reacllocation" = "red",
+  "Including School Contacts" = "blue"
+)
+
+p1 <- bind_cols(
+    sim = out$out$sim,
+    baseline = pull(out$out[, "total_deaths"]) ,
+    noreallocation = pull(sim_noreallocation$out[, "total_deaths"]),
+    noschoolclosure = pull(sim_noschoolclosure$out[, "total_deaths"])
+  )  %>%
+  slice(-c(4, 5)) %>%
+  mutate(sim = names(prior_remap)) %>%
+  ggplot() + 
+  geom_point(aes(sim, baseline, shape ="Baseline"),size=2) +
+  geom_point(aes(sim,  noreallocation, shape= "Without Alter Reacllocation"),size=2) + 
+  geom_point(aes(sim, noschoolclosure, shape= "Including School Contacts"),size=2) +
+  xlab("") + ylab("Deaths") +
+  labs(shape = 'Specification') + 
+    scale_y_continuous(labels = scales::comma)
+
+
+p2 <- bind_cols(
+    sim = out$out$sim,
+    baseline = pull(out$out[, "total_clinical"]) ,
+    noreallocation = pull(sim_noreallocation$out[, "total_clinical"]),
+    noschoolclosure = pull(sim_noschoolclosure$out[, "total_clinical"])
+  ) %>%
+  slice(-c(4, 5)) %>%
+  mutate(sim = names(prior_remap)) %>%
+  ggplot() + 
+  geom_point(aes(sim, baseline, shape="Baseline"),size=2) + 
+  geom_point(aes(sim, noreallocation, shape= "Without Alter Reacllocation"),size=2) + 
+  geom_point(aes(sim, noschoolclosure, shape= "Including School Contacts"),size=2) +
+  xlab("") + ylab("Clinical Infections") +
+  labs(shape = 'Specification') + 
+    scale_y_continuous(labels = scales::comma)
+
+
+cm_sens_plot <- plot_grid(
+  plot_grid(p1+ theme(legend.position = "none"), p2+ theme(legend.position = "none"), ncol = 1),
+  get_legend(p1 ),
+  rel_widths = c(2, 1)
+  
+)
+
+ggsave(file.path(figs_path, "cm_sens_plot.png"), cm_sens_plot, width = plotwidth, height = 4, scale =plotscale)
+
+knitr::include_graphics(file.path(figs_path, "cm_sens_plot.png"))
+```
+
+
+
+
+
+
+
+# Booster scenario
+
+```{r}
+nsims <- 1000
+if (run_sim) {
+  x <- randomLHS(nsims, 3)
+  
+  # R0_vec <- qunif(x[,1], 2.0, 5.0 )
+  R0_vec <- qunif(x[,1], 2.0, 12.0)
+  
+  # Protection from any infection
+  Vb_vec <- qunif(x[,2], .32, .43)
+  Vboost_vec <- qunif(x[,3], .79, .84)
+  
+  registerDoParallel(detectCores())
+  
+  sims_booster <- foreach(i=1:nsims) %dopar% {
+    sim(R0 = R0_vec[i],
+        vu_0 = vu_list$vu_jan2022, 
+        # vu = vu_list$booster, 
+        Vb = Vb_vec[i],
+        Vboost = Vboost_vec[i],
+        daily_vax = 10^6,
+        boosters = TRUE
+        )
+  }
+  
+
+  
+  save(Vb_vec, Vboost_vec,  
+       R0_vec,
+       sims_booster,  
+       file = "sims_data/sims_booster.RData")
+}
+
+load("sims_data/sims_booster.RData")
+
+
+booster_deaths_day0 <- map_dfr(sims_booster, ~.$trajectories$trajectory_none %>% as.data.frame() %>% slice(n()))%>% 
+  select(contains("D_")) %>%
+  rowSums()
+
+booster_clinical_day0 <- map_dfr(sims_booster, ~.$trajectories$trajectory_none %>% as.data.frame() %>% slice(n()))%>% 
+  select(contains("Cc_")) %>%
+  rowSums()
+
+booster_total_day0 <- map_dfr(sims_booster, ~.$trajectories$trajectory_none %>% as.data.frame() %>% slice(n()))%>% 
+  select(contains("Cc_"), contains("Csc_")) %>%
+  rowSums()
+
+
+
+
+sims_booster <- bind_cols(
+  bind_rows(map(sims_booster, ~.$out)),
+  index = rep(1:length(sims_booster), each=6))
+sims_booster_wide <- sims_booster %>%
+  pivot_wider(id_cols = index, names_from = sim, values_from = c(total_deaths, total_clinical)) 
+
+```
+
+
+# Median situation
+```{r}
+
+median_booster_parameters <- list(
+  R0 = median(R0_vec),
+  Vb = median(Vb_vec),
+  Vboost = median(Vboost_vec)
+)
+
+
+s_booster<-sim(
+        R0 = median_booster_parameters[["R0"]],
+        vu_0 = vu_list$vu_jan2022, 
+        # vu = vu_list$booster, 
+        Vb = median_booster_parameters[["Vb"]],
+        Vboost = median_booster_parameters[["Vboost"]],
+        boosters = TRUE,
+        daily_vax = 1000000
+        )
+```
+
+
+
+```{r}
+
+sens_boosters <- sims_booster %>%
+  mutate_at(vars(sim), ~case_when(
+    . == "trajectory_none" ~ "No Vax",
+    . == "trajectory_senior" ~ "65+ Prior",
+    . == "trajectory_hr" ~ "HC Prior",
+    . == "trajectory_split" ~ "Split Prior",
+    . == "trajectory_tiered_sr" ~ "Tiered 65+",
+    . == "trajectory_tiered_hc" ~ "Tiered HC",
+    TRUE ~ NA_character_
+  )) %>%
+  select(sim, index, Deaths = total_deaths, Clinical = total_clinical) %>%
+  drop_na()  %>%
+  group_by(index) %>% 
+  mutate(Deaths =  (Deaths[sim == "No Vax"] - Deaths)/ Deaths[sim == "No Vax"] * 100,
+         Clinical =  (Clinical[sim == "No Vax"] - Clinical)/ Clinical[sim == "No Vax"] * 100) %>%
+  pivot_longer(c(Deaths, Clinical), names_to = "stat") %>%
+  ungroup() %>%
+  filter(sim != "No Vax")
+
+
+
+
+
+# Deaths 
+booster_deaths_ts_novax <- s_booster$trajectories$trajectory_none %>% as_tibble() %>% select(contains("D_")) %>% rowSums() %>% .[1:100]
+booster_deaths_ts_seniorvax <- s_booster$trajectories$trajectory_senior %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+booster_deaths_ts_splitvax <- s_booster$trajectories$trajectory_split %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+booster_deaths_ts_hrvax <- s_booster$trajectories$trajectory_hr %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+booster_deaths_ts_tiered_sr <- s_booster$trajectories$trajectory_tiered_sr %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+booster_deaths_ts_tiered_hc <- s_booster$trajectories$trajectory_tiered_hc %>% as_tibble() %>% select(contains("D_")) %>% rowSums()%>% .[1:100]
+
+booster_deaths_ts <- tibble(
+  date = date_ts,
+  `65+ Prior` =  booster_deaths_ts_novax - booster_deaths_ts_seniorvax ,
+  `Split Prior` = booster_deaths_ts_novax -  booster_deaths_ts_splitvax,
+  `HC Prior` =booster_deaths_ts_novax -  booster_deaths_ts_hrvax,
+  `Tiered 65+` = booster_deaths_ts_novax - booster_deaths_ts_tiered_sr,
+  `Tiered HC` =booster_deaths_ts_novax -  booster_deaths_ts_tiered_hc
+) %>% slice(2:n()) %>%
+  pivot_longer(-date, names_to = "name", values_to = "value")
+
+
+booster_deaths_averted <- ggplot(booster_deaths_ts) +
+  geom_line(aes(date, value, color = name, linetype = name), alpha = linealpha) +
+  xlab("Date") + 
+  ylab("Deaths Averted") + 
+  labs(color = "") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6]) +
+  theme(legend.position = c(0.65, 0.75))  + 
+  scale_y_continuous(labels = scales::comma)
+
+
+
+
+# Infections
+booster_inf_ts_novax <- s_booster$trajectories$trajectory_none %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums() %>% .[1:100]
+booster_inf_ts_seniorvax <- s_booster$trajectories$trajectory_senior %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+booster_inf_ts_splitvax <- s_booster$trajectories$trajectory_split %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+booster_inf_ts_hrvax <- s_booster$trajectories$trajectory_hr %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+booster_inf_ts_tiered_sr <- s_booster$trajectories$trajectory_tiered_sr %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+booster_inf_ts_tiered_hc <- s_booster$trajectories$trajectory_tiered_hc %>% as_tibble() %>% select(contains("Cc_")) %>% rowSums()%>% .[1:100]
+
+
+
+
+booster_inf_ts <- tibble(
+  date = date_ts,
+  `65+ Prior` =  booster_inf_ts_novax - booster_inf_ts_seniorvax,
+  `Split Prior` =booster_inf_ts_novax -  booster_inf_ts_splitvax,
+  `HC Prior` = booster_inf_ts_novax - booster_inf_ts_hrvax,
+  `Tiered 65+` = booster_inf_ts_novax - booster_inf_ts_tiered_sr,
+  `Tiered HC` = booster_inf_ts_novax - booster_inf_ts_tiered_hc
+) %>% slice(2:n()) %>%
+  pivot_longer(-date, names_to = "name", values_to = "value")
+
+booster_infections_averted <- ggplot(booster_inf_ts) +
+  geom_line(aes(date, value, color = name, linetype = name), alpha = linealpha) +
+  xlab("Date") + 
+  ylab("Clinical Infections Averted") + 
+  labs(color = "") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6]) +
+  theme(legend.position = c(0.65, 0.75))  + 
+  scale_y_continuous(labels = scales::comma)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+boosters_summary <- sens_boosters %>% ggplot() +
+  geom_boxplot(aes(x = stat, y = value, color= sim,linetype = sim), fill = "white") +
+  # geom_boxplot_pattern(aes(x  = state, y = value, fill = sim, alpha = sim)) + 
+  ylab("% Reduction") + 
+  xlab("") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6])
+
+
+boosters_plot <- plot_grid(
+  boosters_summary+ theme(legend.position = "none"), 
+  plot_grid(
+    booster_infections_averted + theme(legend.position = c(.6, .35)) + ggtitle(""),
+    booster_deaths_averted + theme(legend.position = "none") + ggtitle(""),
+    align = "hv",
+    labels = c("B", "C"),
+    nrow = 1
+  ),
+  ncol = 1,
+  labels = c("A", "")
+  )
+
+
+ggsave(file.path(figs_path, "boosters.png"), boosters_plot, height = 7, width = plotwidth, bg = "white", scale = plotscale)
+
+knitr::include_graphics(file.path(figs_path, "boosters.png"))
+```
+
+
+In how many sims is each strategy the most effective
+```{r}
+
+sens_boosters %>%
+  filter(stat == "Deaths") %>%
+  group_by(index) %>%
+  summarize(most_effective = sim[which.max(value)]) %>% 
+  pull(most_effective) %>%
+  table()
+
+
+sens_boosters %>%
+  filter(stat == "Clinical") %>%
+  group_by(index) %>%
+  summarize(most_effective = sim[which.max(value)]) %>% 
+  pull(most_effective) %>%
+  table()
+
+
+
+```
+
+
+
+
+```{r}
+nsims <- 100
+
+if (run_sim) {
+  
+  registerDoParallel(detectCores())
+  
+    
+  # Vary Vb
+  booster_vb_vec <- seq(0, .5, length.out = nsims)
+  booster_vb <- foreach(Vb = booster_vb_vec) %dopar% {
+    sim(  R0 = median_booster_parameters[["R0"]],
+          Vboost = median_booster_parameters[["Vboost"]],
+          Vb = Vb,
+          vu_0 = vu_list$vu_jan2022, 
+          boosters = TRUE,
+          printout = FALSE,
+          )$out
+  } 
+  
+  # Vary Vboost
+  booster_vboost_vec <- seq(.5,1, length.out = nsims)
+  booster_vboost <- foreach(Vboost = booster_vboost_vec) %dopar% {
+    sim(  R0 = median_booster_parameters[["R0"]],
+          Vb = median_booster_parameters[["Vb"]],
+          Vboost = Vboost,
+          vu_0 = vu_list$vu_jan2022, 
+          boosters = TRUE,
+        printout = FALSE,
+          )$out
+  } 
+  
+  
+  
+  # Vary R0
+  booster_R0_vec <- seq(2,12, length.out = nsims)
+  booster_R0 <- foreach(R0 = booster_R0_vec) %dopar% {
+    sim(  R0 = R0,
+          Vb = median_booster_parameters[["Vb"]],
+          Vboost = median_booster_parameters[["Vboost"]],
+          vu_0 = vu_list$vu_jan2022, 
+          boosters = TRUE,
+          printout = FALSE,
+          )$out
+  }
+  
+  save(booster_vb_vec, booster_vb, booster_vboost_vec, booster_vboost, booster_R0_vec, booster_R0,
+       file = "sims_data/boosters_sensitivity.Rdata")
+} else {
+  load("sims_data/boosters_sensitivity.Rdata")
+}
+
+
+```
+
+
+
+
+```{r}
+booster_vb <- booster_vb %>% 
+  bind_rows() %>% 
+  bind_cols(index = rep(1:nsims, each = 6)) %>%
+  pivot_wider(id_cols = index, names_from = sim, values_from = c(total_deaths, total_clinical)) 
+
+booster_vboost <- booster_vboost %>% 
+  bind_rows() %>% 
+  bind_cols(index = rep(1:nsims, each = 6)) %>%
+  pivot_wider(id_cols = index, names_from = sim, values_from = c(total_deaths, total_clinical)) 
+
+
+booster_R0 <- booster_R0 %>% 
+  bind_rows() %>% 
+  bind_cols(index = rep(1:nsims, each = 6)) %>%
+  pivot_wider(id_cols = index, names_from = sim, values_from = c(total_deaths, total_clinical)) 
+
+```
+
+
+```{r}
+p1 <- booster_vb %>% ggplot() +
+    geom_line(aes(booster_vb_vec, total_deaths_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(booster_vb_vec, total_deaths_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(booster_vb_vec, total_deaths_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(booster_vb_vec, total_deaths_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(booster_vb_vec, total_deaths_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    geom_line(aes(booster_vb_vec, total_deaths_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+"))+
+    scale_color_manual("Prioritization\nStrategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization\nStrategy", values = lty_remap) +
+    ylab("Total Deaths") +
+    xlab("Effectiveness of 2nd dose") +
+    geom_vline(aes(xintercept = .32), linetype = "dotted") +
+    geom_vline(aes(xintercept = .43), linetype = "dotted") + 
+    scale_y_continuous(labels = scales::comma)
+
+p2 <- booster_vb %>% ggplot() +
+    geom_line(aes(booster_vb_vec, total_clinical_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(booster_vb_vec, total_clinical_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(booster_vb_vec, total_clinical_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(booster_vb_vec, total_clinical_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(booster_vb_vec, total_clinical_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    geom_line(aes(booster_vb_vec, total_clinical_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total clinical") +
+    theme(legend.position = "none")+
+    xlab("Effectiveness of 2nd dose") +
+    geom_vline(aes(xintercept = .32), linetype = "dotted")  +
+    geom_vline(aes(xintercept = .43), linetype = "dotted")   + 
+    scale_y_continuous(labels = scales::comma)
+
+
+
+p3 <- booster_vboost %>% ggplot() +
+    geom_line(aes(booster_vboost_vec, total_deaths_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(booster_vboost_vec, total_deaths_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(booster_vboost_vec, total_deaths_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(booster_vboost_vec, total_deaths_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(booster_vboost_vec, total_deaths_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    geom_line(aes(booster_vboost_vec, total_deaths_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total Deaths") +
+    theme(legend.position = "none")  +
+    xlab("Effectiveness of booster dose") +
+    geom_vline(aes(xintercept = .79), linetype = "dotted")  +
+    geom_vline(aes(xintercept = .84), linetype = "dotted")   + 
+    scale_y_continuous(labels = scales::comma)
+
+p4 <- booster_vboost %>% ggplot() +
+    geom_line(aes(booster_vboost_vec, total_clinical_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(booster_vboost_vec, total_clinical_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(booster_vboost_vec, total_clinical_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(booster_vboost_vec, total_clinical_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(booster_vboost_vec, total_clinical_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    geom_line(aes(booster_vboost_vec, total_clinical_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total clinical") +
+    theme(legend.position = "none") +   
+    xlab("Effectiveness of booster dose") +
+    geom_vline(aes(xintercept = .79), linetype = "dotted")  +
+    geom_vline(aes(xintercept = .84), linetype = "dotted")   + 
+    scale_y_continuous(labels = scales::comma)
+
+
+
+p5 <- booster_R0 %>% ggplot() +
+    geom_line(aes(booster_R0_vec, total_deaths_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(booster_R0_vec, total_deaths_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(booster_R0_vec, total_deaths_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(booster_R0_vec, total_deaths_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(booster_R0_vec, total_deaths_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    geom_line(aes(booster_R0_vec, total_deaths_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total Deaths") +
+    theme(legend.position = "none")  +
+    xlab("R0")  + 
+    scale_y_continuous(labels = scales::comma)
+
+p6 <- booster_R0 %>% ggplot() +
+    geom_line(aes(booster_R0_vec, total_clinical_trajectory_none, color = "No Vax", linetype = "No Vax")) +
+    geom_line(aes(booster_R0_vec, total_clinical_trajectory_senior, color = "65+ Prior", linetype = "65+ Prior")) +
+    geom_line(aes(booster_R0_vec, total_clinical_trajectory_hr, color = "HC Prior", linetype = "HC Prior")) +
+    geom_line(aes(booster_R0_vec, total_clinical_trajectory_split, color = "Split Prior", linetype = "Split Prior"))+
+    geom_line(aes(booster_R0_vec, total_clinical_trajectory_tiered_hc, color = "Tiered HC", linetype = "Tiered HC"))+
+    geom_line(aes(booster_R0_vec, total_clinical_trajectory_tiered_sr, color = "Tiered 65+", linetype = "Tiered 65+"))+
+    scale_color_manual("Prioritization Strategy", values = prior_remap) +
+    scale_linetype_manual("Prioritization Strategy", values = lty_remap) +
+    ylab("Total clinical") +
+    theme(legend.position = "none") +   
+    xlab("R0")  + 
+    scale_y_continuous(labels = scales::comma)
+
+
+
+
+sens_boosters_plot <- plot_grid(
+  plot_grid(
+    p1 + theme(legend.position = "none"),# + ylim(1200000, 4000000), 
+    p2, #+ ylim(50000000,140000000), 
+    p3, #+ ylim(1200000, 4000000), 
+    p4,# + ylim(50000000,140000000),
+    p5,# + ylim(1200000, 4000000), 
+    p6,# + ylim(50000000,140000000),
+    nrow =2 ,
+    byrow = FALSE,
+    align = "hv",
+    labels = "AUTO"
+  ),
+  get_legend(p1),
+  rel_widths = c(5, 1),
+  axis = "r"
+)
+
+ggsave(file.path(figs_path, "sens_boosters_plot.png"), sens_boosters_plot, height = 4, width = plotwidth, bg="white", scale = plotscale)
+
+knitr::include_graphics(file.path(figs_path, "sens_boosters_plot.png"))
+  
+```
+
+
+
+
+# What if adults caught up to seniors on primary vaccination 
+Simulation where we start off with 95% of all adults and seniors vaccinated (children at 35%)
+and still 70% uptake across the board
+```{r}
+if (run_sim){
+  # Use the same distributions as above
+  nsims <- 1000
+  
+  registerDoParallel(7)
+  sims_booster_highuptake <- foreach(i=1:nsims) %dopar% {
+    sim(
+            R0 = R0_vec[i],
+            vu_0 = c(.34, .95, .95, .95), 
+            Vb = Vb_vec[i],
+            Vboost = Vboost_vec[i],
+            boosters = TRUE,
+            daily_vax = 1000000
+            )
+    
+  }
+  
+  sims_booster_highuptake <- bind_cols(
+    bind_rows(map(sims_booster_highuptake, ~.$out)),
+    index = rep(1:length(sims_booster_highuptake), each=6))
+  
+  sims_booster_highuptake_wide <- sims_booster_highuptake %>%
+    pivot_wider(id_cols = index, names_from = sim, values_from = c(total_deaths, total_clinical)) 
+  
+  save(sims_booster_highuptake, sims_booster_highuptake_wide, file = "sims_data/sims_boosters_highuptake.RData")
+
+} else {
+  load("sims_data/sims_boosters_highuptake.RData")
+  
+}
+```
+
+
+
+```{r}
+s_booster_highuptake <- sim(
+        R0 = median_booster_parameters[["R0"]],
+        vu_0 = vu_list$vu_jan2022[c(1,4,4,4)],
+        Vb = median_booster_parameters[["Vb"]],
+        Vboost = median_booster_parameters[["Vboost"]],
+        boosters = TRUE,
+        daily_vax = 1000000
+        )
+
+s_booster_highuptake$out[,2:6] - s_booster$out[,2:6]
+
+sims_booster_highuptake_summary <- sims_booster_highuptake %>%
+  mutate_at(vars(sim), ~case_when(
+    . == "trajectory_none" ~ "No Vax",
+    . == "trajectory_senior" ~ "65+ Prior",
+    . == "trajectory_hr" ~ "HC Prior",
+    . == "trajectory_split" ~ "Split Prior",
+    . == "trajectory_tiered_sr" ~ "Tiered 65+",
+    . == "trajectory_tiered_hc" ~ "Tiered HC",
+    TRUE ~ NA_character_
+  )) %>%
+  select(sim, index, Deaths = total_deaths, Clinical = total_clinical) %>%
+  drop_na()  %>%
+  group_by(index) %>% 
+  mutate(Deaths =  (Deaths[sim == "No Vax"] - Deaths)/ Deaths[sim == "No Vax"] * 100,
+         Clinical =  (Clinical[sim == "No Vax"] - Clinical)/ Clinical[sim == "No Vax"] * 100) %>%
+  pivot_longer(c(Deaths, Clinical), names_to = "stat") %>%
+  ungroup() %>%
+  filter(sim != "No Vax")
+
+
+sims_booster_highuptake_summary <- sims_booster_highuptake_summary %>%
+  ggplot() +
+  geom_boxplot(aes(x = stat, y = value, color= sim,linetype = sim), fill = "white") +
+  # geom_boxplot_pattern(aes(x  = state, y = value, fill = sim, alpha = sim)) + 
+  ylab("% Reduction") + 
+  xlab("") +
+  scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
+  scale_linetype_manual("Prioritization\nStrategy", values = lty_remap[2:6])
+
+
+
+ggsave(file.path(figs_path, "sims_booster_highuptake_summary.png"), sims_booster_highuptake_summary,
+       width = 7, height =5)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+## Supplemental figures: Incidence curves 
+```{r}
+plot_incidence <- function(., trajectory, group, sim_label) { 
+  # Adds a geom_line element. To be used in a pipe.
+  
+  
+  label = switch(group,
+                 "child" = "Child",
+                 "adult_working_inperson" = "Adult HC",
+                 "adult_notworking_inperson" = "Adult LC",
+                 "senior" = "65+")
+  
+  . + geom_line(aes(x = date_vec, 
+                    y = trajectory %>% pull(paste0("Cc_", group)) %>% diff() %>% .[1:length(date_vec)],
+                    color = label,
+                    linetype = sim_label
+                    )) 
+}
+
+ggplot() %>% 
+  plot_incidence(s_booster$trajectories$trajectory_none, group="child", sim_label="None") 
+
+plot_sim <- function(., traj_df, sim_label) {
+  for (g in c("child", "adult_working_inperson", "adult_notworking_inperson", "senior")) {
+    . = plot_incidence(., traj_df, group = g, sim_label = sim_label)
+  }
+  
+  return(.)
+  
+}
+
+
+sp1 <- ggplot() %>% 
+    plot_sim(out$trajectories$trajectory_none, sim_label = "No Vax") %>%
+    plot_sim(out$trajectories$trajectory_senior, sim_label = "65+ Prior") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Vax" = "dashed", "65+ Prior" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp2 <- ggplot() %>% 
+    plot_sim(out$trajectories$trajectory_none, sim_label = "No Vax") %>%
+    plot_sim(out$trajectories$trajectory_tiered_sr, sim_label = "Tiered 65+") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Vax" = "dashed", "Tiered 65+" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp3 <- ggplot() %>% 
+    plot_sim(out$trajectories$trajectory_none, sim_label = "No Vax") %>%
+    plot_sim(out$trajectories$trajectory_hr, sim_label = "HC Prior") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Vax" = "dashed", "HC Prior" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp4 <- ggplot() %>% 
+    plot_sim(out$trajectories$trajectory_none, sim_label = "No Vax") %>%
+    plot_sim(out$trajectories$trajectory_tiered_hc, sim_label = "Tiered HC") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") + 
+    scale_linetype_manual(values = c("No Vax" = "dashed", "Tiered HC" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp5 <- ggplot() %>% 
+    plot_sim(out$trajectories$trajectory_none, sim_label = "No Vax") %>%
+    plot_sim(out$trajectories$trajectory_split, sim_label = "Split Prior") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Vax" = "dashed", "Split Prior" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+
+sp <- plot_grid(
+  sp1 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp2 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp3 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp4 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp5 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  get_legend(sp1+guides(linetype="none")),
+  ncol=2,
+  labels = c("A","B", "C", "D", "E", "")
+)
+
+ggsave(file.path(figs_path, "supplement_incidence.png"),sp, width=10, height=10, bg="white")
+knitr::include_graphics(file.path(figs_path, "supplement_incidence.png"))
+  
+
+
+
+
+
+
+sp1 <- ggplot() %>% 
+    plot_sim(s_booster$trajectories$trajectory_none, sim_label = "No Booster") %>%
+    plot_sim(s_booster$trajectories$trajectory_senior, sim_label = "65+ Prior") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Booster" = "dashed", "65+ Prior" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp2 <- ggplot() %>% 
+    plot_sim(s_booster$trajectories$trajectory_none, sim_label = "No Booster") %>%
+    plot_sim(s_booster$trajectories$trajectory_tiered_sr, sim_label = "Tiered 65+") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Booster" = "dashed", "Tiered 65+" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp3 <- ggplot() %>% 
+    plot_sim(s_booster$trajectories$trajectory_none, sim_label = "No Booster") %>%
+    plot_sim(s_booster$trajectories$trajectory_hr, sim_label = "HC Prior") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Booster" = "dashed", "HC Prior" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp4 <- ggplot() %>% 
+    plot_sim(s_booster$trajectories$trajectory_none, sim_label = "No Booster") %>%
+    plot_sim(s_booster$trajectories$trajectory_tiered_hc, sim_label = "Tiered HC") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") + 
+    scale_linetype_manual(values = c("No Booster" = "dashed", "Tiered HC" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+  
+sp5 <- ggplot() %>% 
+    plot_sim(s_booster$trajectories$trajectory_none, sim_label = "No Booster") %>%
+    plot_sim(s_booster$trajectories$trajectory_split, sim_label = "Split Prior") +
+    ylab("New Clinical Infections") + 
+    xlab("") +
+    labs(color = "Group", linetype = "Prioritization Strategy") +
+    scale_linetype_manual(values = c("No Booster" = "dashed", "Split Prior" = "solid")) + 
+  scale_y_continuous(labels = scales::comma)
+
+sp <- plot_grid(
+  sp1 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp2 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp3 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp4 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  sp5 + guides(color="none") + theme(legend.position = c(.55,.5)),
+  get_legend(sp1+guides(linetype="none")),
+  ncol=2,
+  labels = c("A","B", "C", "D", "E", "")
+)
+
+ggsave(file.path(figs_path, "supplement_incidence_booster.png"),sp, width=10, height=10, bg="white")
+  
+knitr::include_graphics(file.path(figs_path, "supplement_incidence_booster.png"))
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Gender and Ethnicity
+```{r}
+
+library(srvyr)
+
+df_srvyr <- df %>% as_survey_design(weights = weight_pooled)
+  
+gender_ethnicity <- df_srvyr %>% group_by(ego_risk_category, resp_sex) %>% 
+  summarize(prop_sex = survey_prop()) %>% 
+  filter(resp_sex == "Female") %>% 
+  select(prop_sex) %>% 
+left_join(
+  df_srvyr %>% 
+    group_by(ego_risk_category, resp_race_1) %>% 
+      summarize(prop_white = survey_prop()) %>% 
+    drop_na() %>% 
+    select(prop_white)
+) %>% 
+left_join(
+  df_srvyr %>% 
+    group_by(ego_risk_category, resp_race_2) %>% 
+      summarize(prop_black = survey_prop()) %>% 
+    drop_na() %>% 
+    select(prop_black)
+) %>% 
+left_join(
+  df_srvyr %>% 
+    group_by(ego_risk_category, resp_race_4) %>% 
+      summarize(prop_asian = survey_prop()) %>% 
+    drop_na() %>% 
+    select(prop_asian)
+) %>% 
+left_join(
+  df_srvyr %>% 
+    group_by(ego_risk_category, resp_hispanic) %>% 
+      summarize(prop_hispanic = survey_prop()) %>%
+    filter(resp_hispanic == "Yes") %>% 
+    select(prop_hispanic)
+  )
+
+
+out_deaths <- bind_cols(sim = names(out$trajectories),
+          map_dfr(out$trajectories, ~{
+  as.data.frame(.) %>% 
+    select(starts_with("D_"))  %>% slice(n())
+}))
+
+
+out_clinical <- bind_cols(sim = names(out$trajectories),
+          map_dfr(out$trajectories, ~{
+  as.data.frame(.) %>% 
+    select(starts_with("Cc_"))  %>% slice(n())
+}))
+
+
+
+out_deaths <- out_deaths %>% select(-D_child)
+out_clinical <- out_clinical %>% select(-Cc_child)
+
+demog_deaths <- out_deaths %>% 
+  group_by(sim) %>% 
+  summarize(D_total = D_adult_notworking_inperson + D_adult_working_inperson + D_senior,
+            D_women = 
+              D_adult_notworking_inperson * gender_ethnicity[[1, "prop_sex"]]+
+              D_adult_working_inperson * gender_ethnicity[[2, "prop_sex"]]+
+              D_senior * gender_ethnicity[[3, "prop_sex"]],
+            D_white = 
+              D_adult_notworking_inperson * gender_ethnicity[[1, "prop_white"]]+
+              D_adult_working_inperson * gender_ethnicity[[2, "prop_white"]]+
+              D_senior * gender_ethnicity[[3, "prop_white"]],
+            D_black = 
+              D_adult_notworking_inperson * gender_ethnicity[[1, "prop_black"]]+
+              D_adult_working_inperson * gender_ethnicity[[2, "prop_black"]]+
+              D_senior * gender_ethnicity[[3, "prop_black"]],
+            D_asian= 
+              D_adult_notworking_inperson * gender_ethnicity[[1, "prop_asian"]]+
+              D_adult_working_inperson * gender_ethnicity[[2, "prop_asian"]]+
+              D_senior * gender_ethnicity[[3, "prop_asian"]],
+            D_hisp= 
+              D_adult_notworking_inperson * gender_ethnicity[[1, "prop_hispanic"]]+
+              D_adult_working_inperson * gender_ethnicity[[2, "prop_hispanic"]]+
+              D_senior * gender_ethnicity[[3, "prop_hispanic"]]
+            )
+
+out_deaths
+
+demog_deaths <- demog_deaths %>% mutate(across(is.numeric, ~prettyNum(round(.), big.mark = ",")))
+stargazer::stargazer(demog_deaths, summary = FALSE)
+
+ggplot(demog_deaths, aes(x = sim, y = D_women)) + 
+  geom_col() + 
+  coord_flip()
+
+ggplot(demog_deaths, aes(x = sim, y = D_black)) + 
+  geom_col() + 
+  coord_flip()
+
+ggplot(demog_deaths, aes(x = sim, y = D_hisp)) + 
+  geom_col() + 
+  coord_flip()
+
+
+
+
+demog_clinical <- out_clinical %>% 
+  group_by(sim) %>% 
+  summarize(Cc_total = Cc_adult_notworking_inperson + Cc_adult_working_inperson + Cc_senior,
+            Cc_women = 
+              Cc_adult_notworking_inperson * gender_ethnicity[[1, "prop_sex"]]+
+              Cc_adult_working_inperson * gender_ethnicity[[2, "prop_sex"]]+
+              Cc_senior * gender_ethnicity[[3, "prop_sex"]],
+            Cc_white = 
+              Cc_adult_notworking_inperson * gender_ethnicity[[1, "prop_white"]]+
+              Cc_adult_working_inperson * gender_ethnicity[[2, "prop_white"]]+
+              Cc_senior * gender_ethnicity[[3, "prop_white"]],
+            Cc_black = 
+              Cc_adult_notworking_inperson * gender_ethnicity[[1, "prop_black"]]+
+              Cc_adult_working_inperson * gender_ethnicity[[2, "prop_black"]]+
+              Cc_senior * gender_ethnicity[[3, "prop_black"]],
+            Cc_asian= 
+              Cc_adult_notworking_inperson * gender_ethnicity[[1, "prop_asian"]]+
+              Cc_adult_working_inperson * gender_ethnicity[[2, "prop_asian"]]+
+              Cc_senior * gender_ethnicity[[3, "prop_asian"]],
+            Cc_hisp= 
+              Cc_adult_notworking_inperson * gender_ethnicity[[1, "prop_hispanic"]]+
+              Cc_adult_working_inperson * gender_ethnicity[[2, "prop_hispanic"]]+
+              Cc_senior * gender_ethnicity[[3, "prop_hispanic"]]
+            )
+
+demog_clinical
+demog_clinical %>% mutate(across(is.numeric, ~prettyNum(round(.), big.mark = ","))) %>% 
+stargazer::stargazer(summary = FALSE)
+
+
+colnames(gender_ethnicity ) <- c("Category", "Female", "White", "Black", "Asian", "Hispanic")
+gender_ethnicity$Category = c("Adult LC", "Adult HC", "65+")
+gender_ethnicity %>% 
+  mutate(across(is.numeric, ~paste0(round(.*100, 2), "%"))) %>%
+  stargazer::stargazer(summary = FALSE )
+```
+
+
+
+
+# Trajectories by diversity
+```{r}
+gender_ethnicity_t <- gender_ethnicity %>% pivot_longer(-Category) %>% pivot_wider(names_from = Category, values_from = value)
+gender_ethnicity_t <- as.data.frame(gender_ethnicity_t)
+gender_ethnicity_t
+out$trajectories$trajectory_none %>% select(starts_with("D_"))
+N <- out$trajectories$trajectory_none %>% select(starts_with("N_")) %>% slice(1)
+N_geneth <- gender_ethnicity
+
+for (i in 1:3) {
+  N_geneth[i, 2:6] <- print(gender_ethnicity[i, 2:6 ] * N[[i+1]])
+}
+
+N_geneth <- bind_cols(N=colSums(N_geneth[,2:6]), Group = colnames(N_geneth)[2:6])
+
+deaths_ethnicity <- map(out$trajectories,
+    function(x) {
+      bind_cols(date_ts = seq(from = lubridate::mdy("01-01-2021"), length.out = 366,by = "1 day"),
+      
+      Female =x[,"D_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Female", "Adult LC"] +
+              x[,"D_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Female", "Adult HC"] + 
+              x[,"D_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Female", "65+"],
+      
+      White =x[,"D_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "White", "Adult LC"] +
+              x[,"D_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "White", "Adult HC"] + 
+              x[,"D_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "White", "65+"],
+      
+      Black = x[,"D_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Black", "Adult LC"] +
+              x[,"D_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Black", "Adult HC"] + 
+              x[,"D_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Black", "65+"],
+      
+      Asian =x[,"D_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Asian", "Adult LC"] +
+              x[,"D_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Asian", "Adult HC"] + 
+              x[,"D_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Asian", "65+"],
+      
+      Hispanic =x[,"D_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Hispanic", "Adult LC"] +
+              x[,"D_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Hispanic", "Adult HC"] + 
+              x[,"D_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Hispanic", "65+"],
+      
+      )
+    }
+  )
+
+clinical_ethnicity <- map(out$trajectories,
+    function(x) {
+      bind_cols(date_ts = seq(from = lubridate::mdy("01-01-2021"), length.out = 366,by = "1 day"),
+      
+      Female =x[,"Csc_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Female", "Adult LC"] +
+              x[,"Csc_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Female", "Adult HC"] + 
+              x[,"Csc_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Female", "65+"],
+      
+      White =x[,"Csc_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "White", "Adult LC"] +
+              x[,"Csc_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "White", "Adult HC"] + 
+              x[,"Csc_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "White", "65+"],
+      
+      Black = x[,"Csc_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Black", "Adult LC"] +
+              x[,"Csc_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Black", "Adult HC"] + 
+              x[,"Csc_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Black", "65+"],
+      
+      Asian =x[,"Csc_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Asian", "Adult LC"] +
+              x[,"Csc_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Asian", "Adult HC"] + 
+              x[,"Csc_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Asian", "65+"],
+      
+      Hispanic =x[,"Csc_adult_notworking_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Hispanic", "Adult LC"] +
+              x[,"Csc_adult_working_inperson"] * gender_ethnicity_t[gender_ethnicity_t$name == "Hispanic", "Adult HC"] + 
+              x[,"Csc_senior"] * gender_ethnicity_t[gender_ethnicity_t$name == "Hispanic", "65+"],
+      
+      )
+    }
+  )
+
+
+# Make into a single df
+for (i in 1:6) {
+  deaths_ethnicity[[i]]  <-
+    bind_cols(deaths_ethnicity[i], sim = names(deaths_ethnicity)[i])
+}
+
+deaths_ethnicity <- bind_rows(deaths_ethnicity)
+
+deaths_ethnicity <- deaths_ethnicity %>% 
+  pivot_longer(-c(date_ts, sim), names_to = "Group", values_to = "Deaths") 
+
+cbind(N_geneth)
+
+{deaths_ethnicity %>% 
+  mutate(sim = recode(sim, 
+                      "trajectory_hr" = "HC Prior", 
+                      "trajectory_senior" = "65+ Prior",
+                      "trajectory_split" = "Split Prior",
+                      "trajectory_tiered_hc" = "Tiered HC",
+                      "trajectory_tiered_sr" = "Tiered 65+",
+                      "trajectory_none" = "No Vax")) %>%
+  filter(!sim %in% c("trajectory_lr", "trajectory_child", "65+ Prior", "HC Prior", "Split Prior")) %>% 
+  mutate(sim = factor(sim, levels = c("No Vax", "65+ Prior", "HC Prior", "Split Prior", "Tiered 65+", "Tiered HC"))) %>% 
+  drop_na() %>% 
+  filter(date_ts == mdy("04-01-2021")) %>%
+  left_join(N_geneth) %>% 
+  mutate(Deaths = Deaths/N*100000) %>% 
+  ggplot() + 
+  geom_col(aes(x = Group, y = Deaths, fill = sim), position="dodge") + 
+  ylab("Deaths per 100k") + 
+  scale_fill_manual("Prioritization Strategy", values = prior_remap[c("No Vax", "Tiered 65+", "Tiered HC")]) } %>% 
+ggsave(file.path(figs_path, "deaths_ethnicity.png"), ., height = 5, bg = "white")
+
+knitr::include_graphics(file.path(figs_path, "deaths_ethnicity.png"))
+```
+
+
+
+
+
+# Just include the counts of deaths by demographic group
+```{r}
+demog_deaths_2 <- cbind(sim = names(out$trajectories), 
+map_dfr(out$trajectories, {~
+          slice(., n()) %>%
+          select(starts_with("D_"))
+}) 
+)
+
+for (i in 1:6) {
+  demog_deaths_2[i, 2:5] <- demog_deaths_2[i, 2:5] / N * 100000
+}
+
+
+colnames(demog_deaths_2) <- c("Sim" ,"Child", "Adult LC", "Adult HC", "65+")
+demog_deaths_2 <- demog_deaths_2 %>% filter(!Sim %in% c("trajectory_lr", "trajectory_child"))
+demog_deaths_2$Sim <- c("No Vax", "65+ Prior", "HC Prior", "Split Prior", "Tiered 65+", "Tiered HC")
+
+# Divide rows 2-6 by row 1
+r1_v <- demog_deaths_2[1,2:5]
+
+{demog_deaths_2 %>% 
+  pivot_longer(-Sim, names_to = "Group", values_to = "Deaths per 100k") %>% 
+    mutate(Sim = recode(Sim, 
+                      "trajectory_hr" = "HC Prior", 
+                      "trajectory_senior" = "65+ Prior",
+                      "trajectory_split" = "Split Prior",
+                      "trajectory_tiered_hc" = "Tiered HC",
+                      "trajectory_tiered_sr" = "Tiered 65+",
+                      "trajectory_none" = "No Vax")) %>%
+  filter(!Sim %in% c("trajectory_lr", "trajectory_child", "65+ Prior", "HC Prior", "Split Prior")) %>% 
+  mutate(Sim = factor(Sim, levels = c("No Vax", "65+ Prior", "HC Prior", "Split Prior", "Tiered 65+", "Tiered HC"))) %>% 
+  ggplot() + 
+  geom_col(aes(x = "", y = `Deaths per 100k`, fill=Sim), position = "dodge") +
+  scale_fill_manual("Prioritization Strategy", values = prior_remap[c("No Vax", "Tiered 65+", "Tiered HC")]) + 
+  theme(legend.position = "bottom") +
+    xlab("Group") +
+  facet_wrap(.~Group, scales="free_y", nrow = 1)} %>% 
+ggsave(file.path(figs_path, "demog_deaths_2.png"), ., height = 5, bg = "white")
+
+knitr::include_graphics(file.path(figs_path, "demog_deaths_2.png"))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
