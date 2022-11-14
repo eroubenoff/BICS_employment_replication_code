@@ -1,6 +1,8 @@
 This repository contains the replication code for Roubenoff, Feehan, and Mahmud,
 _Evaluating primary and booster vaccination prioritization strategies for COVID-19 by age and high-contact employment status using data from contact surveys_.
 
+For journal revision, we have included the data files, but for distribution
+the replication data must be retrieved separately. 
 
 # Replication code and data files
 This respository contains two R scripts containing the functions

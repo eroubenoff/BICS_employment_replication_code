@@ -129,7 +129,6 @@ knitr::include_graphics(file.path(figs_path, "cm_plot.png"))
 num_cc <- df$num_cc_nonhh * df$weight_pooled
 num_cc[num_cc > 30] <- 30
 work_cc <- df$num_cc_work* df$weight_pooled
-# work_cc[is.na(work_cc)] <- 0
 work_cc <- work_cc[!is.na(work_cc)]
 degree_distribution <- plot_grid(
   qplot(num_cc) + theme_cowplot() + xlab("") + 
@@ -556,11 +555,6 @@ R0_sims_plot <- plot_grid(
     ylab("Total Clinical") +
     theme(legend.position = c(0.65, 0.3)) + 
     scale_y_continuous(labels = scales::comma),   
-  
-    # get_legend(R0_sims %>% ggplot() +
-    #   geom_line(aes(R0, total_clinical_trajectory_none, color = "No Vax")) +
-    #   scale_color_manual("Prioritization Strategy", values = prior_remap)+
-    #   scale_linetype_manual("Prioritization Strategy", values = lty_remap) ),
   nrow =1,
   labels =c("A","B")
   
@@ -868,7 +862,6 @@ nsims <- 1000
 if (run_sim) {
   x <- randomLHS(nsims, 3)
   
-  # R0_vec <- qunif(x[,1], 2.0, 5.0 )
   R0_vec <- qunif(x[,1], 2.0, 12.0)
   
   # Protection from any infection
@@ -1281,12 +1274,12 @@ p6 <- booster_R0 %>% ggplot() +
 
 sens_boosters_plot <- plot_grid(
   plot_grid(
-    p1 + theme(legend.position = "none"),# + ylim(1200000, 4000000), 
-    p2, #+ ylim(50000000,140000000), 
-    p3, #+ ylim(1200000, 4000000), 
-    p4,# + ylim(50000000,140000000),
-    p5,# + ylim(1200000, 4000000), 
-    p6,# + ylim(50000000,140000000),
+    p1 + theme(legend.position = "none"),
+    p2,
+    p3,
+    p4,
+    p5,
+    p6,
     nrow =2 ,
     byrow = FALSE,
     align = "hv",
@@ -1379,7 +1372,6 @@ sims_booster_highuptake_summary <- sims_booster_highuptake %>%
 sims_booster_highuptake_summary <- sims_booster_highuptake_summary %>%
   ggplot() +
   geom_boxplot(aes(x = stat, y = value, color= sim,linetype = sim), fill = "white") +
-  # geom_boxplot_pattern(aes(x  = state, y = value, fill = sim, alpha = sim)) + 
   ylab("% Reduction") + 
   xlab("") +
   scale_color_manual("Prioritization\nStrategy", values = prior_remap[2:6]) +
