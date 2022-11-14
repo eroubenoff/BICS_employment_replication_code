@@ -1,8 +1,6 @@
 This repository contains the replication code for Roubenoff, Feehan, and Mahmud,
 _Evaluating primary and booster vaccination prioritization strategies for COVID-19 by age and high-contact employment status using data from contact surveys_.
 
-For journal revision, we have included the data files, but for distribution
-the replication data must be retrieved separately. 
 
 # Replication code and data files
 This respository contains two R scripts containing the functions
@@ -21,7 +19,7 @@ and functions for loading data and processing results.
 * `figs/`: Output directory for the figures used in the paper
 * `sims_data/`: Cached simulations
 
-We have deposited our data in the Harvard Dataverse (LINK). 
+We have deposited our data in the [Harvard Dataverse](https://doi.org/10.7910/DVN/K8YPVZ). 
 There are four files present in the repository:
 
 * `national_wave4.csv`: BICS wave 4 respondents (selected columns only)
@@ -41,5 +39,5 @@ in SEIR.R (`setwd(...)`) to contain the location of the repository.
 the directory folder `data/`. 
 3) Run all chunks in `SEIR_figures.Rmd`. It is not recommended that you 'knit' 
 this file, rather just run all chunks in the file. 
-> NB: This file can take a while to run (about 2 hours on a 2020 MacBook Air M1). We include a flag `run_sim` on line 28. When set to true (default), the script will cache the simulations in `sims_data/`. When set to false, the script will read the cached simulations without re-running them. Thus, we recommend running once with `run_sim<-TRUE`, and if additional runs are required, using `run_sim<-FALSE`.
+> NB: This file can take a while to run (about 2 hours on a 2020 MacBook Air M1). We include a flag `run_sim` on line 28. When set to true (default), the script will cache the simulations in `sims_data/`. When set to false, the script will read the cached simulations without re-running them. Thus, we recommend running once with `run_sim<-TRUE`, and if additional analysis is required that can make use of cached sims, one can set `run_sim<-FALSE`.
 
